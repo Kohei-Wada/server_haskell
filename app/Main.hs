@@ -11,15 +11,14 @@ import qualified Data.ByteString.Char8 as B8
 import Text.Printf (printf)
 
 import Control.Concurrent.STM.TVar
-import Control.Concurrent.Async (race) 
+import Control.Concurrent.Async (race_) 
 import Control.Concurrent.STM.TChan 
 import Control.Monad.STM
 
 import Data.ByteString (ByteString) 
 import qualified Data.ByteString as B
 
-import Control.Exception (mask, finally) 
-import qualified Control.Exception as E
+import Control.Exception (mask, finally, bracket, bracketOnError) 
 
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -27,8 +26,9 @@ import qualified Data.Map as M
 port :: String
 port = "4444"
 
-newtype Server = Server 
+data Server = Server 
     { clients :: TVar (Map ClientName Client) 
+    , serverChan :: TChan Message
     } 
 
 type ClientName = ByteString
@@ -38,6 +38,7 @@ data Client = Client
     , clientSock     :: Socket
     , clientKicked   :: TVar (Maybe ByteString) 
     , clientSendChan :: TChan Message 
+    , broadcastChan  :: TChan Message
     }
 
 data Message = Notice ByteString
@@ -45,29 +46,36 @@ data Message = Notice ByteString
              | Broadcast ClientName ByteString
              | Command ByteString
 
-newClient :: ClientName -> Socket -> STM Client
-newClient name s = do 
+newClient :: Server -> ClientName -> Socket -> STM Client
+newClient Server{..} name s = do 
     c <- newTChan 
     k <- newTVar Nothing
+    bchan <- dupTChan serverChan
     pure Client 
         { clientName = name
         , clientSock = s
         , clientKicked = k 
         , clientSendChan = c
+        , broadcastChan = bchan
         }
+
 
 sendMessage :: Client -> Message -> STM ()  
 sendMessage Client{..} msg = writeTChan clientSendChan msg
 
+
 newServer :: IO Server
 newServer = do 
     cs <- newTVarIO M.empty 
-    pure $ Server { clients = cs } 
+    bchan <- newBroadcastTChanIO
+    pure $ Server 
+        { clients = cs 
+        , serverChan = bchan
+        } 
+
 
 broadcast :: Server -> Message -> STM () 
-broadcast Server{..} msg = do 
-    clientMap <- readTVar clients
-    mapM_ (\client -> sendMessage client msg) (M.elems clientMap) 
+broadcast Server{..} msg = writeTChan serverChan msg
 
 
 checkAddClient :: Server -> ClientName -> Socket -> IO (Maybe Client) 
@@ -77,7 +85,7 @@ checkAddClient server@Server{..} name s = atomically $ do
        then do 
            pure Nothing
        else do 
-           client <- newClient name s
+           client <- newClient server name s
            writeTVar clients $ M.insert name client clientMap
            broadcast server $ Notice (name <> " has connected")
            pure (Just client) 
@@ -93,7 +101,7 @@ talk :: Socket -> Server -> IO ()
 talk s server = readName where
     readName = do 
         sendAll s "What is your name?\n"
-        name <- B.init <$> recv s 1024
+        name <- B8.init <$> recv s 1024
         if B.null name 
            then readName
            else mask $ \restore -> do 
@@ -107,17 +115,21 @@ talk s server = readName where
 
 
 runClient :: Server -> Client -> IO () 
-runClient serv client@Client{..} = void $ race server receive
+runClient serv client@Client{..} = server `race_` receiver `race_` observer
     where
-        receive = forever $ do 
-            msg <- B.init <$> recv clientSock 1024
-            atomically $ sendMessage client (Command msg)
+        receiver = forever $ do 
+            bstring <- B8.init <$> recv clientSock 1024
+            atomically $ sendMessage client (Command bstring)
         
+        observer = forever $ atomically $ do 
+            msg <- readTChan broadcastChan 
+            sendMessage client msg
+
         server = join $ atomically $ do 
             k <- readTVar clientKicked
             case k of 
               Just reason -> pure $
-                  sendAll clientSock $ "You have been kicked :" <> reason
+                  sendAll clientSock $ "you have been kicked :" <> reason
               Nothing -> do 
                   msg <- readTChan clientSendChan
                   pure $ do 
@@ -136,8 +148,6 @@ handleMessage server client@Client{..} message = do
             ["/quit"] -> do 
                 sendAll clientSock "Goodbye!\n"
                 pure False
-
-            "/" : _  -> output $ msg <> " is unrecognized command."
 
             "/tell" : who : what -> do 
                 tell server client who (B8.unwords what)
@@ -191,24 +201,21 @@ main = withSocketsDo $ do
     server <- newServer
     addr   <- head <$> getAddrInfo (Just hints) mhost (Just port) 
 
-    E.bracket 
-        (do 
+    let befor = do 
             sock <- openSocket addr 
             setSocketOption sock ReuseAddr 1
             bind sock $ addrAddress addr 
             listen sock 1024
             printf "Listen on port %s\n" port
             pure sock 
-        ) 
 
-        (\sock -> do 
+        after sock = do 
             printf "Close server socket\n"
             close sock
-        )
 
-        (\sock -> 
+        thing sock = do 
             forever $ do 
-                E.bracketOnError 
+                bracketOnError 
                     (do
                         (conn, peer) <- accept sock 
                         printf "Accepted connection from %s\n" (show peer)
@@ -227,4 +234,5 @@ main = withSocketsDo $ do
                                 gracefulClose conn 5000
                             ) 
                     )
-        )
+
+    bracket befor after thing 
