@@ -60,10 +60,12 @@ newClient Server{..} name s = do
         }
 
 
+-- | Send a message to the specified client.
 sendMessage :: Client -> Message -> STM ()  
 sendMessage Client{..} msg = writeTChan clientSendChan msg
 
 
+-- | Initialize the server instance.
 newServer :: IO Server
 newServer = do 
     cs <- newTVarIO M.empty 
@@ -74,10 +76,12 @@ newServer = do
         } 
 
 
+-- | Send a message to all connected clients.
 broadcast :: Server -> Message -> STM () 
 broadcast Server{..} msg = writeTChan serverChan msg
 
 
+-- | Check if the given client name is alreay in use.
 checkAddClient :: Server -> ClientName -> Socket -> IO (Maybe Client) 
 checkAddClient server@Server{..} name s = atomically $ do 
     clientMap <- readTVar clients
@@ -91,6 +95,7 @@ checkAddClient server@Server{..} name s = atomically $ do
            pure (Just client) 
 
 
+-- | Disconnect from the specified client.
 removeClient :: Server -> ClientName -> IO () 
 removeClient server@Server{..} name = atomically $ do 
     modifyTVar' clients $ M.delete name
@@ -166,6 +171,7 @@ handleMessage server client@Client{..} message = do
         output m = sendAll clientSock (m <> "\n") >> pure True
 
 
+-- | Disconnect a client that specified by connected user.
 kick :: Server -> ClientName -> ClientName -> STM () 
 kick server@Server{..} who by = do 
     clientMap <- readTVar clients 
