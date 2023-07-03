@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-module Server (runServer) where
+module Server (serverMain) where
 
 import Control.Concurrent (forkFinally) 
 import Control.Monad (join, when, forever, void) 
@@ -29,6 +29,7 @@ port = "4444"
 data Server = Server 
     { clients :: TVar (Map ClientName Client) 
     , serverChan :: TChan Message
+    , serverSock :: Socket
     } 
 
 type ClientName = ByteString
@@ -96,31 +97,31 @@ checkAddClient server@Server{..} name s = atomically $ do
 
 
 -- | Disconnect from the specified client.
-removeClient :: Server -> ClientName -> IO () 
-removeClient server@Server{..} name = atomically $ do 
-    modifyTVar' clients $ M.delete name
-    broadcast server $ Notice (name <> " has disconnected")
+removeClient :: Server -> Client -> IO ()
+removeClient server@Server{..} Client{..} = atomically $ do
+    modifyTVar' clients $ M.delete clientName
+    broadcast server $ Notice (clientName <> " has disconnected")
 
 
 talk :: Socket -> Server -> IO ()  
-talk s server = readName where
+talk peerSock server = readName where
     readName = do 
-        sendAll s "What is your name?\n"
-        name <- B8.init <$> recv s 1024
+        sendAll peerSock "What is your name?\n"
+        name <- B8.init <$> recv peerSock 1024
         if B.null name 
            then readName
            else mask $ \restore -> do 
-               ok <- checkAddClient server name s
+               ok <- checkAddClient server name peerSock
                case ok of 
                  Nothing -> restore $ do 
-                     sendAll s $ "The name " <> name <> " is in use, pelase choose another\n"
+                     sendAll peerSock $ "The name " <> name <> " is in use, pelase choose another\n"
                      readName
                  Just client -> do 
-                     restore (runClient server client) `finally` removeClient server name
+                     restore (communicate server client) `finally` removeClient server client
 
 
-runClient :: Server -> Client -> IO () 
-runClient serv client@Client{..} = server `race_` receiver `race_` observer
+communicate :: Server -> Client -> IO ()
+communicate server client@Client{..} = loop `race_` receiver `race_` observer
     where
         receiver = forever $ do 
             bstring <- B8.init <$> recv clientSock 1024
@@ -130,7 +131,7 @@ runClient serv client@Client{..} = server `race_` receiver `race_` observer
             msg <- readTChan broadcastChan 
             sendMessage client msg
 
-        server = join $ atomically $ do 
+        loop = join $ atomically $ do
             k <- readTVar clientKicked
             case k of 
               Just reason -> pure $
@@ -138,8 +139,8 @@ runClient serv client@Client{..} = server `race_` receiver `race_` observer
               Nothing -> do 
                   msg <- readTChan clientSendChan
                   pure $ do 
-                      continue <- handleMessage serv client msg
-                      when continue $ server
+                      continue <- handleMessage server client msg
+                      when continue $ loop
 
 
 handleMessage :: Server -> Client -> Message -> IO Bool
@@ -199,46 +200,51 @@ tell server Client{..} who msg = do
        else sendAll clientSock $ who <> " is not connected.\n"
 
 
-runServer :: IO () 
-runServer = withSocketsDo $ do 
+resolveAddr :: IO AddrInfo
+resolveAddr = do
     let mhost = Nothing
         hints = defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }
+    head <$> getAddrInfo (Just hints) mhost (Just port)
 
+
+listenServer :: Server -> IO Server
+listenServer s = do
+    a <- resolveAddr
+    sock <- openSocket a
+    setSocketOption sock ReuseAddr 1
+    bind sock $ addrAddress a
+    listen sock 1024
+    printf "Listen on port %s\n" port
+    pure s { serverSock = sock }
+
+
+discardServer :: Server -> IO ()
+discardServer Server{..} = do
+    close serverSock
+    printf "Close server socket\n"
+
+
+runServer :: Server -> IO ()
+runServer s@Server{..} = do
+    forever $ do
+        bracketOnError prepare closePeer serve
+            where
+                prepare = do
+                    (conn, peer) <- accept serverSock
+                    printf "Accepted connection from %s\n" (show peer)
+                    pure (conn, peer)
+
+                closePeer (conn, peer) = do
+                    printf "Connection is closed by %s\n" (show peer)
+                    close conn
+
+                serve (conn, peer) = void $
+                    forkFinally (talk conn s) $ \_ -> do
+                            printf "Closed connection from %s\n" (show peer)
+                            gracefulClose conn 5000
+
+
+serverMain :: IO ()
+serverMain = withSocketsDo $ do
     server <- newServer
-    addr   <- head <$> getAddrInfo (Just hints) mhost (Just port) 
-
-    let befor = do 
-            sock <- openSocket addr 
-            setSocketOption sock ReuseAddr 1
-            bind sock $ addrAddress addr 
-            listen sock 1024
-            printf "Listen on port %s\n" port
-            pure sock 
-
-        after sock = do 
-            printf "Close server socket\n"
-            close sock
-
-        thing sock = do 
-            forever $ do 
-                bracketOnError 
-                    (do
-                        (conn, peer) <- accept sock 
-                        printf "Accepted connection from %s\n" (show peer)
-                        pure (conn, peer)
-                    )
-
-                    (\(conn, peer) -> do 
-                        printf "Connection is closed by %s\n" (show peer)
-                        close conn
-                    )
-
-                    (\(conn, peer) -> do 
-                        forkFinally (talk conn server) 
-                            (\_ -> do
-                                printf "Closed connection from %s\n" (show peer)
-                                gracefulClose conn 5000
-                            ) 
-                    )
-
-    bracket befor after thing 
+    bracket (listenServer server) discardServer runServer
