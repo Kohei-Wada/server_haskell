@@ -66,33 +66,22 @@ sendMessage :: Client -> Message -> STM ()
 sendMessage Client{..} msg = writeTChan clientSendChan msg
 
 
--- | Initialize the server instance.
-newServer :: IO Server
-newServer = do 
-    cs <- newTVarIO M.empty 
-    bchan <- newBroadcastTChanIO
-    pure $ Server 
-        { clients = cs 
-        , serverChan = bchan
-        } 
-
-
 -- | Send a message to all connected clients.
 broadcast :: Server -> Message -> STM () 
 broadcast Server{..} msg = writeTChan serverChan msg
 
 
 -- | Check if the given client name is alreay in use.
-checkAddClient :: Server -> ClientName -> Socket -> IO (Maybe Client) 
-checkAddClient server@Server{..} name s = atomically $ do 
+checkAddClient :: Server -> ClientName -> Socket -> IO (Maybe Client)
+checkAddClient s@Server{..} name clientSock = atomically $ do
     clientMap <- readTVar clients
     if M.member name clientMap 
        then do 
            pure Nothing
        else do 
-           client <- newClient server name s
+           client <- newClient s name clientSock
            writeTVar clients $ M.insert name client clientMap
-           broadcast server $ Notice (name <> " has connected")
+           broadcast s $ Notice (name <> " has connected")
            pure (Just client) 
 
 
@@ -117,6 +106,7 @@ talk peerSock server = readName where
                      sendAll peerSock $ "The name " <> name <> " is in use, pelase choose another\n"
                      readName
                  Just client -> do 
+                     sendAll peerSock "Enter '/help' to show help.\n"
                      restore (communicate server client) `finally` removeClient server client
 
 
@@ -163,6 +153,12 @@ handleMessage server client@Client{..} message = do
                 atomically $ kick server who clientName
                 pure True
 
+            ["/help"] -> do
+                output helpMessage
+
+            ["/?"] -> do
+                output helpMessage
+
             [] -> pure True
 
             _ -> do 
@@ -207,17 +203,29 @@ resolveAddr = do
     head <$> getAddrInfo (Just hints) mhost (Just port)
 
 
-listenServer :: Server -> IO Server
-listenServer s = do
+-- | Initialize the server instance.
+newServer :: IO Server
+newServer = do
+    cs <- newTVarIO M.empty
+    bchan <- newBroadcastTChanIO
+
     a <- resolveAddr
     sock <- openSocket a
     setSocketOption sock ReuseAddr 1
     bind sock $ addrAddress a
-    listen sock 1024
-    printf "Listen on port %s\n" port
-    pure s { serverSock = sock }
+
+    pure $ Server
+        { clients = cs
+        , serverChan = bchan
+        , serverSock = sock
+        }
 
 
+helpMessage :: ByteString
+helpMessage = "Command are: /help, /tell, /kick, /quit, /?"
+
+
+-- | discard the server instance.
 discardServer :: Server -> IO ()
 discardServer Server{..} = do
     close serverSock
@@ -226,25 +234,26 @@ discardServer Server{..} = do
 
 runServer :: Server -> IO ()
 runServer s@Server{..} = do
+    listen serverSock 1024
+    printf "Listen on port %s\n" port
+
     forever $ do
-        bracketOnError prepare closePeer serve
+        bracketOnError acceptPeer closePeer serve
             where
-                prepare = do
-                    (conn, peer) <- accept serverSock
+                acceptPeer = do
+                    (peerSock, peer) <- accept serverSock
                     printf "Accepted connection from %s\n" (show peer)
-                    pure (conn, peer)
+                    pure (peerSock, peer)
 
-                closePeer (conn, peer) = do
+                closePeer (peerSock, peer) = do
                     printf "Connection is closed by %s\n" (show peer)
-                    close conn
+                    close peerSock
 
-                serve (conn, peer) = void $
-                    forkFinally (talk conn s) $ \_ -> do
+                serve (peerSock, peer) = void $
+                    forkFinally (talk peerSock s) $ \_ -> do
                             printf "Closed connection from %s\n" (show peer)
-                            gracefulClose conn 5000
+                            gracefulClose peerSock 5000
 
 
 serverMain :: IO ()
-serverMain = withSocketsDo $ do
-    server <- newServer
-    bracket (listenServer server) discardServer runServer
+serverMain = withSocketsDo $ bracket newServer discardServer runServer
