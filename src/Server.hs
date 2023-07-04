@@ -47,6 +47,8 @@ data Message = Notice ByteString
              | Broadcast ClientName ByteString
              | Command ByteString
 
+
+-- | Receive the name of the client and initialize the client object.
 newClient :: Server -> ClientName -> Socket -> STM Client
 newClient Server{..} name s = do 
     c <- newTChan 
@@ -61,17 +63,13 @@ newClient Server{..} name s = do
         }
 
 
--- | Send a message to the specified client.
-sendMessage :: Client -> Message -> STM ()  
-sendMessage Client{..} msg = writeTChan clientSendChan msg
-
-
 -- | Send a message to all connected clients.
 broadcast :: Server -> Message -> STM () 
 broadcast Server{..} msg = writeTChan serverChan msg
 
 
 -- | Check if the given client name is alreay in use.
+-- if the name is not in use, create client object and register it.
 checkAddClient :: Server -> ClientName -> Socket -> IO (Maybe Client)
 checkAddClient s@Server{..} name clientSock = atomically $ do
     clientMap <- readTVar clients
@@ -92,7 +90,9 @@ removeClient server@Server{..} Client{..} = atomically $ do
     broadcast server $ Notice (clientName <> " has disconnected")
 
 
-talk :: Socket -> Server -> IO ()  
+-- | Receive the client's socket and ask for the name of the peer.
+-- If the received name is not registered, register it and start chatting.
+talk :: Socket -> Server -> IO ()
 talk peerSock server = readName where
     readName = do 
         sendAll peerSock "What is your name?\n"
@@ -110,6 +110,9 @@ talk peerSock server = readName where
                      restore (communicate server client) `finally` removeClient server client
 
 
+-- | Start chatting with a client.
+-- It forks a thread that communicates with clients and writes requests to channels,
+-- a thread that monitors global channels, and a thread that handles client requests.
 communicate :: Server -> Client -> IO ()
 communicate server client@Client{..} = loop `race_` receiver `race_` observer
     where
@@ -125,12 +128,20 @@ communicate server client@Client{..} = loop `race_` receiver `race_` observer
             k <- readTVar clientKicked
             case k of 
               Just reason -> pure $
-                  sendAll clientSock $ "you have been kicked :" <> reason
+                  sendAll clientSock $ "you have been kicked " <> reason
               Nothing -> do 
                   msg <- readTChan clientSendChan
                   pure $ do 
                       continue <- handleMessage server client msg
                       when continue $ loop
+
+
+tell :: Server -> Client -> ClientName -> ByteString -> IO ()
+tell server Client{..} who msg = do
+    ok <- atomically $ sendToName server who (Tell clientName msg)
+    if ok
+       then pure ()
+       else sendAll clientSock $ who <> " is not connected.\n"
 
 
 handleMessage :: Server -> Client -> Message -> IO Bool
@@ -169,7 +180,7 @@ handleMessage server client@Client{..} message = do
 
 
 -- | Disconnect a client that specified by connected user.
-kick :: Server -> ClientName -> ClientName -> STM () 
+kick :: Server -> ClientName -> ClientName -> STM ()
 kick server@Server{..} who by = do 
     clientMap <- readTVar clients 
     case M.lookup who clientMap of 
@@ -180,6 +191,11 @@ kick server@Server{..} who by = do
           void $ sendToName server by $ Notice ("you kicked " <> who)
 
 
+-- | Send a message to the specified client.
+sendMessage :: Client -> Message -> STM ()
+sendMessage Client{..} msg = writeTChan clientSendChan msg
+
+
 sendToName :: Server -> ClientName -> Message -> STM Bool
 sendToName Server{..} name msg = do 
     clientMap <- readTVar clients
@@ -187,20 +203,6 @@ sendToName Server{..} name msg = do
       Nothing     -> pure False
       Just client -> sendMessage client msg >> pure True
 
-
-tell :: Server -> Client -> ClientName -> ByteString -> IO () 
-tell server Client{..} who msg = do 
-    ok <- atomically $ sendToName server who (Tell clientName msg) 
-    if ok 
-       then pure () 
-       else sendAll clientSock $ who <> " is not connected.\n"
-
-
-resolveAddr :: IO AddrInfo
-resolveAddr = do
-    let mhost = Nothing
-        hints = defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }
-    head <$> getAddrInfo (Just hints) mhost (Just port)
 
 
 -- | Initialize the server instance.
@@ -219,6 +221,13 @@ newServer = do
         , serverChan = bchan
         , serverSock = sock
         }
+
+    where
+        resolveAddr :: IO AddrInfo
+        resolveAddr = do
+            let mhost = Nothing
+                hints = defaultHints { addrFlags = [AI_PASSIVE], addrSocketType = Stream }
+            head <$> getAddrInfo (Just hints) mhost (Just port)
 
 
 helpMessage :: ByteString
