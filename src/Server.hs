@@ -64,8 +64,8 @@ newClient Server{..} name s = do
 
 
 -- | Send a message to all connected clients.
-broadcast :: Server -> Message -> STM () 
-broadcast Server{..} msg = writeTChan serverChan msg
+broadcast :: Server -> Message -> STM ()
+broadcast Server{..} = writeTChan serverChan
 
 
 -- | Check if the given client name is alreay in use.
@@ -133,7 +133,7 @@ communicate server client@Client{..} = loop `race_` receiver `race_` observer
                   msg <- readTChan clientSendChan
                   pure $ do 
                       continue <- handleMessage server client msg
-                      when continue $ loop
+                      when continue loop
 
 
 tell :: Server -> Client -> ClientName -> ByteString -> IO ()
@@ -193,7 +193,7 @@ kick server@Server{..} who by = do
 
 -- | Send a message to the specified client.
 sendMessage :: Client -> Message -> STM ()
-sendMessage Client{..} msg = writeTChan clientSendChan msg
+sendMessage Client{..} = writeTChan clientSendChan
 
 
 sendToName :: Server -> ClientName -> Message -> STM Bool
